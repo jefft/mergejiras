@@ -1,0 +1,431 @@
+-- Functions to copy logical entities (currently users) from one JIRA database to another, copying all relevant data in
+-- the various tables.  Idempotent, and gracefully merges data when the target JIRA already contains parts.
+--
+-- You will need to replace occurrences of 'struts' with that of your source database. Users are copied from the source
+-- schema ('struts') into the current schema (eg. 'public').
+--
+-- Jeff Turner <jefft@apache.org>, 2010-02-19
+
+-- create language plpgsql;
+create or replace function uniquifyname(oldname varchar) returns varchar as $$
+BEGIN
+	-- eg. convert 'Dashboard' to 'Struts Dashboard' so it doesn't conflict with the one in the destination JIRA.
+	return 'Struts ' || oldname;
+END;
+$$ language plpgsql;
+
+create or replace function translategroup(oldname varchar) returns varchar as $$
+BEGIN
+	-- An opportunity to rewrite group memberships. In my case I want members of the Struts 'jira-administrators' group to
+	-- become members of a less powerful 'struts-administrators' group in the main JIRA.
+
+	if oldname='jira-administrators' then
+		return 'struts-administrators';
+	else
+		return oldname;
+	end if;
+END;
+$$ language plpgsql;
+
+-- Given a row in table «tbl» in the Struts database, returns the ID of the equivalent row in the new database.
+-- Equivalence is usually a matter of comparing relevant fields, but in the
+-- case of portalpage and favouriteassociations table, this isn't enough
+-- information, and the function then compares related tables to see if our row references an equivalent data.
+create or replace function newid(tbl varchar, oldid numeric(18)) RETURNS integer AS $$
+DECLARE
+	nid integer;
+BEGIN
+	if oldid is null then return null; end if;
+	if tbl='project' then
+		select p.id into nid from struts.project s, public.project p where s.pkey=p.pkey and s.id=oldid;
+	elsif tbl='component' then
+		select p.id into nid from struts.component s, public.component p where p.project=newid('project', s.project) and s.cname=p.cname and s.id=oldid;
+	elsif tbl='issuestatus' then
+		select p.id into nid from struts.issuestatus s, public.issuestatus p where s.pname=p.pname and s.id=oldid::varchar;
+	elsif tbl='resolution' then
+		if oldid=-1 then nid=oldid;
+		else
+		select p.id into nid from struts.resolution s, public.resolution p where s.pname=p.pname and s.id=oldid::varchar;
+		end if;
+	elsif tbl='issuetype' then
+		if oldid=-2 or oldid=-3 then nid=oldid;
+		else 
+		select p.id into nid from struts.issuetype s, public.issuetype p where s.pname=p.pname and s.id=oldid::varchar;
+		end if;
+	elsif tbl='projectversion' then
+		if oldid=-1 or oldid=-2 or oldid=-3 then nid=oldid;
+		else
+		select p.id into nid from struts.projectversion s, public.projectversion p where p.project=newid('project', s.project) and s.vname=p.vname and s.id=oldid;
+		end if;
+	elsif tbl='priority' then
+		select p.id into nid from struts.priority s, public.priority p where s.pname=p.pname and s.id=oldid::varchar;
+	elsif tbl='customfield' then
+		-- FIXME: handle the case where customfields are unique per project or issuetype
+		select p.id into nid from struts.customfield s, public.customfield p where s.cfname=p.cfname and s.customfieldtypekey=p.customfieldtypekey and s.customfieldsearcherkey=p.customfieldsearcherkey and s.id=oldid;
+	elsif tbl='searchrequest' then
+		select p.id into nid from struts.searchrequest s, public.searchrequest p where s.authorname=p.authorname and s.filtername=p.filtername and s.id=oldid;
+	elsif tbl='columnlayout' then
+		select p.id into nid from struts.columnlayout s, public.columnlayout p where s.id=oldid and ((s.username is null and p.searchrequest=newid('searchrequest', s.searchrequest)) or (s.username=p.username and s.searchrequest is null));
+	elsif tbl='portalpage' then
+		-- Consider dashboards named 'Foo' and 'Struts Foo' as equivalent.
+		-- Consider dashboards as equivalent only if they have the same portlets (equality determined concatenating all portlet titles together into one long string, and comparing the two).
+		select p.id into nid from struts.portalpage s, public.portalpage p where s.id=oldid and s.username=p.username and (s.pagename=p.pagename or p.pagename=uniquifyname(s.pagename)) and s.fav_count=p.fav_count and (select textcat_all(portlet_id || column_number || positionseq) from (select * from portletconfiguration order by portlet_id) my where my.portalpage=p.id) = (select textcat_all(portlet_id || column_number || positionseq) from (select * from struts.portletconfiguration order by portlet_id) my where my.portalpage=s.id);
+	elsif tbl='favouriteassociations' then
+		-- favouriteassociations are a generic way of marking certain things as important to the user, in order of rank. We consider there to be an equivalent one present in the new database if its username, entity type match, and entity id match (translating as appropriate for the type).
+		-- To speed this up:
+		-- create index portletconfig_portalpage on portletconfiguration(portalpage);
+		select p.id into nid from struts.favouriteassociations s, public.favouriteassociations p where s.username=p.username and s.entitytype=p.entitytype and ((s.entitytype='SearchRequest' and p.entityid = newid('searchrequest', s.entityid)) OR (s.entitytype='PortalPage' and p.entityid = newid('portalpage', s.entityid))) and s.id=oldid;
+	elsif tbl='membershipbase' then
+		select p.id into nid from struts.membershipbase s, public.membershipbase p where s.id=oldid and s.user_name=p.user_name and p.group_name=translategroup(s.group_name);
+	elsif tbl='jiraissue' then
+		select p.id into nid from struts.jiraissue s, public.jiraissue p where s.id=oldid and s.pkey=p.pkey;
+-- 		if exists (select * from struts.jiraissue s, public.jiraissue p where s.id=oldid and p.id=nid and s.summary!=p.summary) then
+-- 			raise exception 'oldissue id %, newissue id %: summaries to not match in old and new JIRAs', oldid, nid;
+-- 		end if;
+	elsif tbl='fileattachment' then
+		select p.id into nid from struts.fileattachment s, public.fileattachment p where s.id=oldid and s.filename=p.filename and s.filesize=p.filesize and p.issueid=newid('jiraissue', s.issueid);
+	elsif tbl='projectcategory' then
+		select p.id into nid from struts.projectcategory s, public.projectcategory p where s.id=oldid and s.cname=p.cname;
+	else
+		raise exception 'Unhandled table %', tbl;
+	end if;
+	-- if nid is null then raise exception 'No % matching old id %', tbl, oldid; end if;
+	return nid;
+END
+$$ LANGUAGE plpgsql;
+
+create or replace function newfieldidentifier(oldfield varchar) RETURNS varchar AS $$
+DECLARE
+	newfield varchar;
+	oldcfid integer;
+	newcfid integer;
+BEGIN
+	if oldfield LIKE 'customfield_%' then
+		RAISE NOTICE 'Looking up a customfield %', oldfield;
+		oldcfid := replace(oldfield, 'customfield_', '')::integer;
+		select newid('customfield', oldcfid) into newcfid;
+		RAISE NOTICE 'Replacing cf % with %', oldcfid, newcfid;
+		newfield='customfield_' || newcfid;
+	else
+		newfield:=oldfield;
+	end if;
+	if newfield is null then raise exception 'No matching old id %', oldfield; end if;
+	return newfield;
+END
+$$ LANGUAGE plpgsql;
+
+create or replace function translate_propertystringval(key varchar, oldval varchar) returns varchar as $$
+DECLARE
+	newval varchar := oldval;
+BEGIN
+	if key='projectid' then
+		newval := coalesce(newid('project', oldval::integer), oldval::integer);
+	elsif key='filterid' then
+		newval := coalesce(newid('searchrequest', oldval::integer), oldval::integer);
+	elsif key='projectcategoryid' then
+		if oldval='' then
+			newval := oldval;
+		else
+			newval := coalesce(newid('projectcategory', oldval::integer), oldval::integer);
+		end if;
+	elsif key='versionid' then
+		newval := coalesce(newid('projectversion', oldval::integer), oldval::integer);
+	elsif key='projectOrFilterId' and oldval like 'filter-%' then
+		newval := 'filter-' || newid('searchrequest', replace(oldval, 'filter-', '')::integer);
+		-- not sure what the other string is - 'project-%' perhaps?
+	end if;
+	if oldval!=newval then raise notice 'Converted % % to %', key, oldval, newval; end if;
+	return newval;
+END;
+$$ language plpgsql;
+
+create or replace function fix() returns void as $$
+DECLARE rec RECORD;
+BEGIN
+for rec in select x.psid, x.property_key, x.propertyvalue  as oldval, translate_propertystringval(x.property_key, x.propertyvalue) as newval from (select ps.id as psid, * from propertyentry pe, propertystring ps where pe.id=ps.id and pe.property_key in ('projectid', 'projectcategoryid', 'projectsEnt', 'filterid', 'projectOrFilterId', 'versionid', 'statuses') and pe.entity_name='PortletConfiguration' and pe.id>12541405) as x LOOP
+	raise notice 'Considering % % % %', rec.psid, rec.property_key, rec.oldval, rec.newval;
+	update propertystring set propertyvalue=rec.newval where id=rec.psid;
+END LOOP;
+END
+$$ LANGUAGE plpgsql;
+
+
+create or replace function copyproperties(entityname varchar, oldentityid numeric(18,0), newentityid numeric(18,0)) RETURNS void AS $$
+DECLARE
+	pe RECORD;
+	pt RECORD;
+	newpval varchar;
+	peid integer;
+BEGIN
+	FOR pe in select * from struts.propertyentry spe where spe.entity_name=entityname and spe.entity_id=oldentityid and not exists (select * from public.propertyentry where entity_name=entityname and entity_id=newentityid and property_key=spe.property_key) LOOP
+		insert into public.propertyentry (entity_name,entity_id,property_key,propertytype) values (pe.entity_name, newentityid, pe.property_key, pe.propertytype) returning id into peid;
+		RAISE NOTICE 'Created pe % (%, %)', peid, pe.entity_name, pe.property_key;
+		FOR pt in SELECT * FROM struts.propertynumber WHERE id=pe.id LOOP insert into public.propertynumber (id,propertyvalue) values (peid, pt.propertyvalue); END LOOP;
+		FOR pt in SELECT * FROM struts.propertydecimal WHERE id=pe.id LOOP insert into public.propertydecimal (id,propertyvalue) values (peid, pt.propertyvalue); END LOOP;
+		FOR pt in SELECT * FROM struts.propertystring WHERE id=pe.id LOOP insert into public.propertystring (id,propertyvalue) values (peid, translate_propertystringval(pe.property_key, pt.propertyvalue)); END LOOP;
+		FOR pt in SELECT * FROM struts.propertytext WHERE id=pe.id LOOP insert into public.propertytext (id,propertyvalue) values (peid, pt.propertyvalue); END LOOP;
+		FOR pt in SELECT * FROM struts.propertydate WHERE id=pe.id LOOP insert into public.propertydate (id,propertyvalue) values (peid, pt.propertyvalue); END LOOP;
+		FOR pt in SELECT * FROM struts.propertydata WHERE id=pe.id LOOP insert into public.propertydata (id,propertyvalue) values (peid, pt.propertyvalue); END LOOP;
+	END LOOP;
+END
+$$ LANGUAGE plpgsql;
+
+
+create or replace function copyportalpage(oldportalpageid numeric(18,0)) RETURNS integer AS $$
+DECLARE
+        newportalpageid integer;
+        newportletconfigurationid integer;
+	oldportalpage RECORD;
+	nextsequence integer := 0;
+	newpagename varchar;
+	portletconfig RECORD;
+BEGIN
+	FOR oldportalpage in SELECT id,username,pagename,description,sequence,fav_count from struts.portalpage sp where id=oldportalpageid and newid('portalpage', oldportalpageid) is null LOOP
+		-- newid() ensures that oldportalpage hasn't already been inserted, but there may already be an identical-looking portalpage row (having different actual portlets). This is common when a user has created a default dashboard called 'Dashboard' on both JIRAs:
+		-- jira_merge_3135=> select * from struts.portalpage where id=10424;
+		--   id   | username | pagename  | description | sequence | fav_count 
+		--   -------+----------+-----------+-------------+----------+-----------
+		--    10424 | jwalnes1 | Dashboard |             |        0 |         1
+		--    (1 row)
+		-- jira_merge_3135=> select * from portalpage where id=10022;
+		--   id   | username | pagename  | description | sequence | fav_count 
+		--   -------+----------+-----------+-------------+----------+-----------
+		--    10022 | jwalnes1 | Dashboard |             |        0 |         1
+		--    (1 row)
+
+		-- If a user has multiple dashboards, each is assigned a sequence value. This query finds the existing portalpage in the target database with the greated sequence, and stores that + 1 in nextsequence for use in the insert.  If the user has no custom dashboards, the default value of 0 is used.
+		select pp.sequence+1 into nextsequence from (select username, max(sequence) as maxseq from portalpage group by username) as x inner join portalpage as pp on x.username=pp.username and x.maxseq=pp.sequence and pp.username=oldportalpage.username;
+		-- Say our new portalpage has pagename 'Dashboard', and there is already a 'Dashboard'.  In that case this conditional block sets newpagename to 'Struts Dashboard':
+		if exists (select * from portalpage where username=oldportalpage.username and pagename=oldportalpage.pagename) then
+			newpagename := uniquifyname(oldportalpage.pagename);
+			RAISE NOTICE 'User % already has portalpage "%". Setting new pagename to %', oldportalpage.username, oldportalpage.pagename, newpagename;
+		else
+			newpagename := oldportalpage.pagename;
+		end if;
+		insert into public.portalpage (username,pagename,description,sequence,fav_count) values (oldportalpage.username, newpagename, oldportalpage.description,nextsequence,oldportalpage.fav_count) returning id into newportalpageid;
+		RAISE NOTICE 'Created portalpage % (%, %, %) from %', newportalpageid, oldportalpage.username, newpagename, nextsequence, oldportalpage.id;
+		FOR portletconfig in SELECT * from struts.portletconfiguration where portalpage=oldportalpageid LOOP
+			insert into public.portletconfiguration (portalpage,portlet_id,column_number,positionseq) values (newportalpageid, portletconfig.portlet_id, portletconfig.column_number, portletconfig.positionseq) returning id into newportletconfigurationid;
+
+			RAISE NOTICE '    portalpage %, created portletconfiguration %', newportalpageid, newportletconfigurationid;
+			execute copyproperties('PortletConfiguration', portletconfig.id, newportletconfigurationid);
+		END LOOP;
+	END LOOP;
+	return newportalpageid;
+END
+$$ LANGUAGE plpgsql;
+
+create or replace function copyportalpages(oldusername varchar) RETURNS void AS $$
+DECLARE
+	portalpage RECORD;
+BEGIN
+	for portalpage in SELECT * from struts.portalpage WHERE username=oldusername LOOP
+		RAISE DEBUG 'Considering portalpage %', portalpage.id;
+		PERFORM copyportalpage(portalpage.id);
+	END LOOP;
+END
+$$ LANGUAGE plpgsql;
+
+create or replace function copysearchrequest(oldsrid numeric(18,0)) RETURNS integer AS $$
+DECLARE
+	oldsr RECORD;
+	newsearchrequestid integer;
+BEGIN
+	FOR oldsr in SELECT * from struts.searchrequest sr where sr.id=oldsrid and newid('searchrequest', oldsrid) is null LOOP
+	-- FOR oldsr in SELECT * from struts.searchrequest sr where not exists (select * from public.searchrequest where username=sr.username and filtername=sr.filtername) and id=oldsrid LOOP
+		insert into public.searchrequest (filtername,authorname,description,username,groupname,projectid,reqcontent,fav_count) values (oldsr.filtername,oldsr.authorname,oldsr.description,oldsr.username,oldsr.groupname,newid('project', oldsr.projectid),oldsr.reqcontent || ' <!-- CONVERTME: struts.searchrequest ' || oldsr.id || ' -->',oldsr.fav_count) returning id into newsearchrequestid;
+		RAISE NOTICE 'Created searchrequest %, converting oldsr %, oldproject % to newproject %', newsearchrequestid, oldsr.id, oldsr.projectid, newid('project', oldsr.projectid);
+	END LOOP;
+	return newsearchrequestid;
+END
+$$ LANGUAGE plpgsql;
+
+create or replace function copysharepermissions() returns void AS $$
+DECLARE
+	oldsp RECORD;
+	newentityid integer;
+	newspid integer;
+BEGIN
+	for oldsp in select * from struts.sharepermissions LOOP
+		if oldsp.entitytype='SearchRequest' then
+			select newid('searchrequest', oldsp.entityid) into newentityid;
+		elsif oldsp.entitytype='PortalPage' then
+			select newid('portalpage', oldsp.entityid) into newentityid;
+		else
+			raise exception 'Unknown entitytype % for id %', oldsp.entitytype, oldsp.id;
+		end if;
+	
+		insert into public.sharepermissions (entityid, entitytype, sharetype, param1, param2) values (newentityid, oldsp.entitytype, oldsp.sharetype, oldsp.param1, oldsp.param2) returning id  into newspid;
+		RAISE NOTICE 'Created sharepermissions % ( %, %)', newspid, newentityid, oldsp.entitytype;
+	END LOOP;
+
+END
+$$ LANGUAGE plpgsql;
+
+create or replace function copysearchrequests(srauthor varchar(255)) RETURNS void AS $$
+DECLARE
+	oldsr RECORD;
+BEGIN
+	for oldsr in SELECT * from struts.searchrequest WHERE authorname=srauthor LOOP
+		RAISE DEBUG 'Considering searchrequest % for user %', oldsr.id, srauthor;
+		PERFORM copysearchrequest(oldsr.id);
+	END LOOP;
+END
+$$ LANGUAGE plpgsql;
+
+
+create or replace function copycolumnlayout(oldcolumnlayoutid numeric(18,0)) RETURNS integer AS $$
+DECLARE
+	oldcolumnlayout RECORD;
+	layoutitem RECORD;
+	newsrid integer;
+	newcolumnlayoutid integer;
+	newcolumnlayoutitemid integer;
+BEGIN
+	-- columnlayout records have either a username set, or a searchrequest:
+	-- 
+	-- 	  id   |         username         | searchrequest 
+	-- -------+--------------------------+---------------
+	--  10170 | benja73                  |              
+	--  10132 | rickbecca                |              
+	--  10316 |                          |         10767
+	--  10374 | brenmcguire              |              
+	--  10281 |                          |         10701
+
+	FOR oldcolumnlayout in SELECT * from struts.columnlayout cl where cl.id=oldcolumnlayoutid and newid('columnlayout', oldcolumnlayoutid) is null LOOP
+		select newid('searchrequest', oldcolumnlayout.searchrequest) into newsrid;
+		insert into public.columnlayout (username,searchrequest) values (oldcolumnlayout.username, newsrid) returning id into newcolumnlayoutid;
+		RAISE NOTICE 'Created columnlayout % (%, %) from %', newcolumnlayoutid, oldcolumnlayout.username, newsrid, oldcolumnlayout.id;
+
+		FOR layoutitem in SELECT * from struts.columnlayoutitem where columnlayout=oldcolumnlayoutid LOOP
+			insert into public.columnlayoutitem (columnlayout,fieldidentifier,horizontalposition) values (newcolumnlayoutid, newfieldidentifier(layoutitem.fieldidentifier), layoutitem.horizontalposition) returning id into newcolumnlayoutitemid;
+			RAISE NOTICE '    columnlayout %: created columnlayoutitem %', newcolumnlayoutid, newcolumnlayoutitemid;
+		END LOOP;
+
+	END LOOP;
+	return newcolumnlayoutid;
+END
+$$ LANGUAGE plpgsql;
+
+create or replace function copycolumnlayouts(clusername varchar(255)) RETURNS void AS $$
+DECLARE
+	oldcolumnlayout RECORD;
+BEGIN
+	for oldcolumnlayout in SELECT * from struts.columnlayout WHERE username=clusername LOOP
+		RAISE DEBUG 'Examining columnlayout % for user %', oldcolumnlayout.id, clusername;
+		PERFORM copycolumnlayout(oldcolumnlayout.id);
+	END LOOP;
+END
+$$ LANGUAGE plpgsql;
+
+-- NB: only run this after copyportalpages and copysearchrequests, otherwise it will fail.
+create or replace function copyfavouriteassociations(fausername varchar(255)) RETURNS void AS $$
+DECLARE
+	oldassoc RECORD;
+	newentityid integer;
+	newfaid integer;
+	nextsequence integer := 0;
+BEGIN
+	for oldassoc in SELECT * from struts.favouriteassociations fa WHERE username=fausername and newid('favouriteassociations', fa.id) is null LOOP
+		if oldassoc.entitytype='PortalPage' then
+			select newid('portalpage', oldassoc.entityid) into newentityid;
+		elsif oldassoc.entitytype='SearchRequest' then
+			select newid('searchrequest', oldassoc.entityid) into newentityid;
+		else
+			raise exception 'favouriteassociations with id=% has unknown entitytype %', oldassoc.id, oldassoc.entitytype;
+		end if;
+		if newentityid is null then
+			-- sanity check: we ought to have copied in portalpages and searchrequests before calling this.
+			raise exception 'struts.favouriteassociations % references a % with id % that doesn''t map to anything in the new JIRA', oldassoc.id, oldassoc.entitytype, oldassoc.entityid;
+		end if;
+
+		-- As with portalpage, we may already have a favouriteassociation, in which case the row we insert must have a sequence value equal to the existing max, plus 1
+		select pp.sequence+1 into nextsequence from (select username, max(sequence) as maxseq from favouriteassociations where entitytype=oldassoc.entitytype group by username) as x inner join favouriteassociations as pp on x.username=pp.username and x.maxseq=pp.sequence and pp.username=oldassoc.username;
+
+		insert into public.favouriteassociations (username,entitytype,entityid,sequence) values (oldassoc.username, oldassoc.entitytype, newentityid, nextsequence) returning id into newfaid;
+		RAISE NOTICE 'Created new favouriteassociations % (%, %, %) from %', newfaid, oldassoc.username, oldassoc.entitytype, newentityid, oldassoc.id;
+	END LOOP;
+END
+$$ LANGUAGE plpgsql;
+
+create or replace function copygroupmemberships(oldusername varchar) returns void as $$
+DECLARE
+	oldassoc RECORD;
+	newmbid integer;
+	newgroup varchar;
+BEGIN
+	for oldassoc in SELECT * from struts.membershipbase mb WHERE user_name=oldusername and newid('membershipbase', mb.id) is null LOOP
+		select translategroup(oldassoc.group_name) into newgroup;
+		insert into public.membershipbase (user_name, group_name) values (oldassoc.user_name, newgroup) returning id into newmbid;
+		RAISE NOTICE 'Created new membershipbase % (%, %) from %', newmbid, oldassoc.user_name, newgroup, oldassoc.id;
+	end loop;
+	
+END
+$$ LANGUAGE plpgsql;
+
+
+create or replace function copyuser(oldusername varchar) RETURNS integer AS $$
+DECLARE
+	olduser RECORD;
+        newuserid integer;
+BEGIN
+	-- FOR olduser in select id, username, password_hash from struts.userbase su where id=olduserid and not exists (select * from public.userbase where username=su.username) LOOP
+	FOR olduser in select id, username, password_hash from struts.userbase su where username=oldusername LOOP
+		select id into newuserid from public.userbase where username=olduser.username;
+		if newuserid is null then
+			insert into public.userbase (username,password_hash) values (olduser.username, olduser.password_hash) returning id into newuserid;
+			RAISE NOTICE 'Created user %', newuserid;
+		end if;
+		-- Note the order is important here:
+		-- - columnlayouts depend on searchrequest
+		-- - favouriteassociations refer to searchrequests and portalpages
+		-- - portlets may refer to searchrequests
+		execute copyproperties('OSUser', olduser.id, newuserid);
+		execute copysearchrequests(olduser.username);
+		execute copycolumnlayouts(olduser.username);
+		execute copyportalpages(olduser.username);
+		execute copyfavouriteassociations(olduser.username);
+		execute copygroupmemberships(olduser.username);
+	END LOOP;
+	return newuserid;
+END
+$$ LANGUAGE plpgsql;
+
+
+create or replace function copycopyrights() returns void as $$
+DECLARE
+	rec RECORD;
+BEGIN
+	for rec in select sfa.id as oldid, fa.id as newid from struts.fileattachment sfa, struts.propertyentry spe, struts.propertynumber spn, public.fileattachment fa WHERE sfa.id=spe.entity_id and spe.id=spn.id and spe.entity_name='FileAttachment' and spe.property_key='apache.assignedcopyright' and fa.id=(select newid('fileattachment', sfa.id)) LOOP
+		RAISE DEBUG 'Considering %', rec.oldid;
+		execute copyproperties('FileAttachment', rec.oldid, rec.newid);
+	end loop;
+	
+END
+$$ LANGUAGE plpgsql;
+
+create or replace function copyprojectcategories() returns void as $$
+DECLARE
+	rec RECORD;
+BEGIN
+	for rec in select * from struts.projectcategory where newid('projectcategory', id) is null LOOP
+		insert into public.projectcategory (cname, description) values (rec.cname, rec.description);
+	end loop;
+	
+END
+$$ LANGUAGE plpgsql;
+
+
+create or replace function copyprojectcategorymemberships() returns void as $$
+DECLARE
+	rec RECORD;
+BEGIN
+	for rec in select * from struts.nodeassociation where source_node_entity='Project' and sink_node_entity='ProjectCategory' LOOP
+		RAISE NOTICE 'Creating projectcategory assoc from project %, category %', rec.source_node_id, rec.sink_node_id;
+		insert into public.nodeassociation (source_node_id, source_node_entity, sink_node_id, sink_node_entity, association_type, sequence) values (newid('project', rec.source_node_id), rec.source_node_entity, newid('projectcategory', rec.sink_node_id), rec.sink_node_entity, rec.association_type, rec.sequence);
+	end loop;
+	
+END
+$$ LANGUAGE plpgsql;
+
+-- vim: set ft=sql:

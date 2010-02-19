@@ -1,0 +1,104 @@
+-- Script to simplify SQL inserts in a JIRA database.
+--
+-- For tables with a numeric ID as the primary key, the JIRA database relies on the caller to set that ID correctly to
+-- n+1, and also to update the SEQUENCE_VALUE_ITEM table to keep track of the range that n has reached.  In most case
+-- the 'caller' is JIRA itself, via the Ofbiz database library.  When we are manually inserting rows into the database,
+-- we need to get the ID right, and also remember to update the relevant SEQUENCE_VALUE_ITEM row. Eg.:
+--
+-- SELECT max(id) FROM userbase;  -- Eg. returns 10050;
+-- INSERT INTO userbase (id, username, password_hash) VALUES (10051, 'binky', '.....');
+-- UPDATE SEQUENCE_VALUE_ITEM SET SEQ_ID=10060 WHERE SEQ_NAME='OSUser';
+--
+-- This script relieves you of the tedium of calculating IDs by hand and updating SEQUENCE_VALUE_ITEM. After sourcing
+-- this script, the above SQL can be replaced with:
+--
+-- INSERT INTO userbase (username, password_hash) VALUES ('binky', '......');
+--
+-- The script works by making the 'default' ID a function call, and having that function calculate the next ID and also
+-- update SEQUENCE_VALUE_ITEM.  If the caller has explicitly set the ID, as is the case with JIRA-generated SQL, the
+-- default is ignored, so it is safe to have this in a production JIRA database.
+--
+-- Note that while manual INSERTs are correctly handled, manual DELETEs will still leave the SEQUENCE_VALUE_ITEM table
+-- unmodified. If you manually insert a lot of records, then delete them all and don't want any record remaining you'll
+-- have to manually reset SEQUENCE_VALUE_ITEM.
+--
+-- Jeff Turner <jefft@apache.org>, 2010-02-19
+
+create language plpgsql;
+drop table if exists primarykeyinfo;
+create table primarykeyinfo (name varchar, pk varchar, entity varchar);
+comment on table primarykeyinfo is 'Records primary ID locations for each OFbiz type (referenced in SEQUENCE_VALUE_ITEM.seq_name). Used by updateseq function';
+insert into primarykeyinfo values ('jiraissue', 'id', 'Issue');
+insert into primarykeyinfo values ('userbase', 'id', 'OSUser');
+insert into primarykeyinfo values ('propertyentry', 'id', 'OSPropertyEntry');
+insert into primarykeyinfo values ('searchrequest', 'id', 'SearchRequest');
+insert into primarykeyinfo values ('sharepermissions', 'id', 'SharePermissions');
+insert into primarykeyinfo values ('favouriteassociations', 'id', 'FavouriteAssociations');
+insert into primarykeyinfo values ('fileattachment', 'id', 'FileAttachment');
+insert into primarykeyinfo values ('membershipbase', 'id', 'OSMembership');
+insert into primarykeyinfo values ('portalpage', 'id', 'PortalPage');
+insert into primarykeyinfo values ('portletconfiguration', 'id', 'PortletConfiguration');
+insert into primarykeyinfo values ('columnlayout', 'id', 'ColumnLayout');
+insert into primarykeyinfo values ('columnlayoutitem', 'id', 'ColumnLayoutItem');
+insert into primarykeyinfo values ('projectcategory', 'id', 'ProjectCategory');
+insert into primarykeyinfo values ('sharepermissions', 'id', 'SharePermissions');
+
+create or replace function updateseq(tablename varchar)
+	returns void AS $$
+DECLARE
+    maxid integer;
+    seqid integer;
+    nextseqid integer;
+    tablepk varchar;
+    tableentity varchar;
+BEGIN
+	select pk, entity into tablepk, tableentity from primarykeyinfo where name=tablename;
+	EXECUTE 'select max(' || quote_ident(tablepk) || ') from ' || quote_ident(tablename) into maxid;
+	select seq_id into seqid from sequence_value_item where seq_name=tableentity;
+	if maxid > seqid or seqid > maxid+10 then
+			nextseqid = maxid + 10 - mod((maxid), 10);
+			update sequence_value_item set seq_id=nextseqid where seq_name=tableentity;
+			RAISE DEBUG 'Updated % sequence_value_item from % to %', tableentity, seqid, nextseqid;
+	end if;
+END;
+$$ LANGUAGE plpgsql;
+comment on function updateseq (varchar) is 'Synchronizes the sequence_value_item table with the actual max(id) of the specified table. Used by nextid( varchar ) function.';
+
+create or replace function nextid(tablename varchar)
+	returns integer AS $$
+DECLARE
+	newid integer;
+    seqid integer;
+    nextseqid integer;
+	tablepk varchar;
+	tableentity varchar;
+BEGIN
+	select pk, entity into tablepk, tableentity from primarykeyinfo where name=tablename;
+	EXECUTE 'select max(' || quote_ident(tablepk) || ')+1 from ' || quote_ident(tablename) into newid;
+	select seq_id into seqid from sequence_value_item where seq_name=tableentity;
+	if newid > seqid or seqid > newid+10 then
+			nextseqid = newid + 10 - mod((newid), 10);
+			update sequence_value_item set seq_id=nextseqid where seq_name=tableentity;
+			RAISE DEBUG 'Updated % sequence_value_item from % to %', tableentity, seqid, nextseqid;
+	end if;
+	return newid;
+END;
+$$ LANGUAGE plpgsql;
+comment on function nextid (varchar) is 'Generates the next free numeric primary key ID for the indicated table. This function can be set as the ''default'' id value for tables.
+Note that this function operates on tables in the current schema of the caller.';
+
+alter table jiraissue ALTER id SET DEFAULT nextid('jiraissue');
+alter table userbase ALTER id SET DEFAULT nextid('userbase');
+alter table propertyentry ALTER id SET DEFAULT nextid('propertyentry');
+alter table searchrequest ALTER id SET DEFAULT nextid('searchrequest');
+alter table sharepermissions ALTER id SET DEFAULT nextid('sharepermissions');
+alter table favouriteassociations ALTER id SET DEFAULT nextid('favouriteassociations');
+alter table fileattachment ALTER id SET DEFAULT nextid('fileattachment');
+alter table membershipbase ALTER id SET DEFAULT nextid('membershipbase');
+alter table portalpage ALTER id SET DEFAULT nextid('portalpage');
+alter table portletconfiguration ALTER id SET DEFAULT nextid('portletconfiguration');
+alter table columnlayout ALTER id SET DEFAULT nextid('columnlayout');
+alter table columnlayoutitem ALTER id SET DEFAULT nextid('columnlayoutitem');
+alter table projectcategory ALTER id SET DEFAULT nextid('projectcategory');
+alter table sharepermissions ALTER id SET DEFAULT nextid('sharepermissions');
+-- vim: set ft=sql:
