@@ -232,7 +232,7 @@ DECLARE
 	newsearchrequestid integer;
 BEGIN
 	FOR oldsr in SELECT * from struts.searchrequest sr where sr.id=oldsrid and newid('searchrequest', oldsrid) is null LOOP
-	-- FOR oldsr in SELECT * from struts.searchrequest sr where not exists (select * from public.searchrequest where username=sr.username and filtername=sr.filtername) and id=oldsrid LOOP
+		-- NOTE: The CONVERTME comment is a marker that tells the subsequent cleanup script, convertsearchrequests.rb, that this XML needs its IDs converted. If you modify the marker here, also modify it in convertsearchrequests.rb
 		insert into public.searchrequest (filtername,authorname,description,username,groupname,projectid,reqcontent,fav_count) values (oldsr.filtername,oldsr.authorname,oldsr.description,oldsr.username,oldsr.groupname,newid('project', oldsr.projectid),oldsr.reqcontent || ' <!-- CONVERTME: struts.searchrequest ' || oldsr.id || ' -->',oldsr.fav_count) returning id into newsearchrequestid;
 		RAISE NOTICE 'Created searchrequest %, converting oldsr %, oldproject % to newproject %', newsearchrequestid, oldsr.id, oldsr.projectid, newid('project', oldsr.projectid);
 	END LOOP;
