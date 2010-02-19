@@ -13,9 +13,13 @@ require 'rubygems'
 require 'dbi'
 require 'nokogiri'
 
-# String in an XML comment identifying searchrequests that need converting.
-# Inserted by copy.plpgsql's copysearchrequest function - if you customize this, modify that too.
-MARKERSTR='CONVERTME: struts.searchrequest'
+# String in an XML comment identifying searchrequests that need converting. If you change this, also change it in
+# copy.plpgsql and searchrequest_map.sql
+OLDDB="struts"
+# Inserted by copy.plpgsql's copysearchrequest function.
+OLDMARKER='CONVERTME: #{OLDDB}.searchrequest'
+# Inserted by this script, used by the searchrequest_map.sql function.
+NEWMARKER="SearchRequest converted from #{OLDDB} database, id"
 
 errmsg = "Please define PGDATABASE, PGUSER, PGPASSWORD and optionally PGHOST / PGPORT"
 $db=ENV["PGDATABASE"] or raise errmsg
@@ -42,13 +46,13 @@ def translateid(mapkey, oldid)
 end 
 
 # Fish searchrequest records created by a valid (imported) user out of the old JIRA
-rows = $dbh.select_all("select * from public.searchrequest where reqcontent like '%<!-- #{MARKERSTR} %'")
+rows = $dbh.select_all("select * from public.searchrequest where reqcontent like '%<!-- #{OLDMARKER} %'")
 rows.each do |row|
 
 	# Manipulate the searchrequest XML, rewriting IDs according to the $JiraIDMap mapping
 	sr = Nokogiri::XML(row["reqcontent"])
-	commentnode = sr.xpath "comment()[contains(., '#{MARKERSTR} ')]"
-	oldsrid = commentnode.to_s.scan(/#{MARKERSTR} (\d+)/)[0][0].to_i
+	commentnode = sr.xpath "comment()[contains(., '#{OLDMARKER} ')]"
+	oldsrid = commentnode.to_s.scan(/#{OLDMARKER} (\d+)/)[0][0].to_i
 	commentnode.remove
 
 	# Sample searchrequest XML:
@@ -67,7 +71,7 @@ rows.each do |row|
 	#   </sort>
 	# </searchrequest>
 
-	sr.root.add_previous_sibling(Nokogiri::XML::Comment.new(sr, "SearchRequest converted from id #{oldsrid} in old database"))
+	sr.root.add_previous_sibling(Nokogiri::XML::Comment.new(sr, NEWMARKER +" #{oldsrid}"))
 	# Possible elements: projid status version priority issue_author issue_assignee component   fixfor resolution type created
 	# Elements we care about: projid version fixfor status priority component resolution type 
 	srElements = {"projid"=>:project,
